@@ -1,0 +1,41 @@
+name: net-check
+# Temporary diagnostic for online play (relay servers + two-browser tests). Lives only on the net-check branch.
+on:
+  push:
+    branches: [net-check]
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LOCAL_TESTS: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install Playwright
+        working-directory: tools/netcheck
+        run: |
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund playwright@1.49.1
+          npx playwright install --with-deps firefox chromium
+      - name: Serve this branch on localhost
+        run: |
+          nohup python3 -m http.server 8080 --bind 127.0.0.1 >/tmp/http.log 2>&1 &
+          sleep 1
+          curl -sf http://127.0.0.1:8080/index.html | grep -o 'net.js?v=[0-9]*'
+      - name: Run network check
+        working-directory: tools/netcheck
+        run: |
+          if [ "$LOCAL_TESTS" = "1" ]; then export LOCAL="http://localhost:8080/?v=local$GITHUB_RUN_ID"; fi
+          node run.js
+      - name: Firewall back to normal
+        if: always()
+        run: sudo iptables -F NETCHECK || true; sudo ip6tables -F NETCHECK || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: netcheck-report
+          path: tools/netcheck/netcheck-report.json
