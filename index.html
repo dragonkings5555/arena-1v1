@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Arena 1v1</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0b0e14; }
+    body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; }
+    canvas { max-width: 100vw; max-height: calc(100vh - 40px); border-radius: 6px; box-shadow: 0 10px 40px rgba(0,0,0,.6); }
+  </style>
+</head>
+<body>
+  <canvas id="game" tabindex="0"></canvas>
+  <script src="config.js"></script>
+  <script src="arena.js"></script>
+  <script src="player.js"></script>
+  <script src="combat.js"></script>
+  <script src="fx.js"></script>
+  <script src="characters.js"></script>
+  <script src="abilities/kunai.js"></script>
+  <script src="abilities/orb.js"></script>
+  <script src="abilities/mine.js"></script>
+  <script src="abilities/dash.js"></script>
+  <script src="abilities/void.js"></script>
+  <script src="abilities/parry.js"></script>
+  <script src="sprites/sprites.js"></script>
+  <script src="sprites/gunner.js"></script>
+  <script src="sprites/ninja.js"></script>
+  <script src="sprites/voidwalker.js"></script>
+  <script src="avatars/avatars.js"></script>
+  <script src="avatars/gunner.js"></script>
+  <script src="avatars/ninja.js"></script>
+  <script src="avatars/voidwalker.js"></script>
+  <script src="hud.js"></script>
+  <script src="select.js"></script>
+  <script src="main.js"></script>
+  <script src="vendor/peerjs.min.js"></script>
+  <script src="net.js"></script>
+</body>
+</html>
