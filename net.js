@@ -8,6 +8,7 @@
 window.Game = window.Game || {};
 
 Game.Net = (function () {
+  const VERSION = 'v3';
   const PEER_PREFIX = 'arena1v1-room-';
   const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const params = new URLSearchParams(location.search);
@@ -290,6 +291,10 @@ Game.Net = (function () {
   ];
   function peerOpts() { return { debug: 1, config: { iceServers: ICE_SERVERS } }; }
 
+  // Visible debug line on the room/join screens, so a failed connect can be reported exactly.
+  const dbg = { server: '-', link: '-', last: '' };
+  function debug(k, v) { dbg[k] = v; UI.debugLine('debug ' + VERSION + ' \u00B7 server: ' + dbg.server + ' \u00B7 link: ' + dbg.link + (dbg.last ? ' \u00B7 ' + dbg.last : '')); }
+
   let attempt = 0; // bumps on every host/join so timers from an old attempt can't show errors over a new one
 
   // Watch the WebRTC link of a connection that hasn't opened yet and say what is happening.
@@ -299,6 +304,7 @@ Game.Net = (function () {
     pc.addEventListener('iceconnectionstatechange', () => {
       if (!isCurrent()) return;
       const st = pc.iceConnectionState;
+      debug('link', st);
       if (st === 'checking') UI.setMsg('Linking the two devices...');
       if (st === 'failed') onFail();
     });
@@ -321,10 +327,13 @@ Game.Net = (function () {
     const p = peer = new Peer(PEER_PREFIX + code, peerOpts());
     const cur = () => my === attempt && net.mode === 'local';
     const regTimeout = setTimeout(() => { if (cur() && !p.open) UI.error('Could not reach the game server to create a room. Check your internet and try again.'); }, 12000);
-    p.on('open', () => { clearTimeout(regTimeout); if (cur()) UI.waiting(code); });
+    debug('server', 'connecting'); debug('link', '-');
+    p.on('open', () => { clearTimeout(regTimeout); if (cur()) { UI.waiting(code); debug('server', 'registered ' + code); } });
     // Phones drop the server connection when you switch apps (e.g. to send the code); reconnect so the room stays joinable.
+    p.on('disconnected', () => { debug('server', 'lost, reconnecting'); });
     p.on('disconnected', () => { if (my === attempt && !p.destroyed) setTimeout(() => { if (!p.destroyed) p.reconnect(); }, 500); });
     p.on('error', (e) => {
+      debug('last', 'error ' + e.type);
       if (!cur()) return;
       if (e.type === 'unavailable-id') return net.host(); // code taken, roll a new one
       if (e.type === 'network' || e.type === 'server-error' || e.type === 'socket-error' || e.type === 'socket-closed') return; // handled by reconnect
@@ -333,6 +342,7 @@ Game.Net = (function () {
     p.on('connection', (c) => {
       if (conn) { c.on('open', () => c.close()); return; } // room is full
       if (cur()) UI.setMsg('Your friend found the room. Linking the two devices...');
+      debug('last', 'friend knocked');
       c.on('open', () => { if (my === attempt) { wire(c, 'host'); startSession('host', c); } });
       setTimeout(() => watchIce(c, cur, () => UI.setMsg('Your friend found the room, but your networks blocked the link. Try a different wifi or mobile data.')), 0);
     });
@@ -356,6 +366,7 @@ Game.Net = (function () {
     const p = peer = new Peer(peerOpts());
     const cur = () => my === attempt && net.mode === 'local';
     let stage = 'server';
+    debug('server', 'connecting'); debug('link', '-'); debug('last', '');
     const fail = (msg) => { if (cur()) { endQuiet(); UI.error(msg); } };
     const timeout = setTimeout(() => {
       if (stage === 'server') fail('Could not reach the game server. Check your internet and try again.');
@@ -364,13 +375,15 @@ Game.Net = (function () {
     p.on('open', () => {
       if (!cur()) return;
       stage = 'room';
+      debug('server', 'ok');
       UI.setMsg('Looking for room ' + code + '...');
       const c = p.connect(PEER_PREFIX + code, { reliable: true, serialization: 'raw' });
       c.on('open', () => { clearTimeout(timeout); if (my === attempt) { wire(c, 'guest'); startSession('guest', c); } });
-      c.on('error', (e) => { if (cur()) UI.setMsg('Connection error: ' + (e.type || e.message)); });
+      c.on('error', (e) => { debug('last', 'conn error ' + (e.type || e.message)); if (cur()) UI.setMsg('Connection error: ' + (e.type || e.message)); });
       setTimeout(() => watchIce(c, cur, () => { stage = 'ice'; }), 0);
     });
     p.on('error', (e) => {
+      debug('last', 'error ' + e.type);
       if (!cur()) return;
       clearTimeout(timeout);
       if (e.type === 'peer-unavailable') fail('No room with code ' + code + '. Check the code, and that the host is still on the room screen.');
@@ -383,6 +396,40 @@ Game.Net = (function () {
     if (peer) { try { peer.destroy(); } catch (e) {} }
     peer = null;
   }
+
+  // "Test my connection": can we reach the game server, and which kinds of network routes does this device get?
+  // host = same-network route, srflx = internet route (STUN), relay = relay server (TURN, works on strict networks).
+  net.selfTest = function () {
+    UI.connecting('Testing your connection (about 8 seconds)...');
+    const out = [];
+    let server = 'no reply';
+    try {
+      const tp = new Peer(peerOpts());
+      tp.on('open', () => { server = 'ok'; tp.destroy(); });
+      tp.on('error', (e) => { server = 'error ' + e.type; });
+    } catch (e) { server = 'PeerJS failed: ' + e.message; }
+    const kinds = { host: 0, srflx: 0, relay: 0 };
+    const relays = new Set();
+    let pc;
+    try {
+      pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      pc.createDataChannel('t');
+      pc.onicecandidate = (e) => {
+        if (!e.candidate) return;
+        const m = / typ (\w+)/.exec(e.candidate.candidate);
+        if (m && m[1] in kinds) kinds[m[1]]++;
+        if (m && m[1] === 'relay' && e.candidate.url) relays.add(e.candidate.url.split(':')[1]);
+      };
+      pc.createOffer().then((o) => pc.setLocalDescription(o));
+    } catch (e) { out.push('WebRTC unavailable: ' + e.message); }
+    setTimeout(() => {
+      if (pc) pc.close();
+      out.unshift('Game server: ' + server);
+      out.push('Routes: same-network ' + kinds.host + ', internet ' + kinds.srflx + ', relay ' + kinds.relay + (relays.size ? ' (' + [...relays].join(', ') + ')' : ''));
+      const ok = server === 'ok' && (kinds.srflx || kinds.relay);
+      UI.show((ok ? 'Looks OK. ' : 'Problem found. ') + out.join(' | ') + ' | ' + VERSION);
+    }, 8000);
+  };
 
   net.leave = function () { endSession(''); };
   net.local = function () { endQuiet(); UI.hide(); UI.status(); };
@@ -438,6 +485,7 @@ Game.Net = (function () {
 
     function el(html) { const d = document.createElement('div'); d.innerHTML = html.trim(); return d.firstChild; }
     function card(inner) { menu.innerHTML = ''; const c = el('<div class="card"></div>'); c.innerHTML = inner; menu.appendChild(c); menu.hidden = false; return c; }
+    let lastDebug = '';
     function shareLink(code) { const u = new URL(location.href); u.searchParams.set('room', code); return u.toString(); }
 
     const ui = {
@@ -448,8 +496,12 @@ Game.Net = (function () {
           <div class="row"><input maxlength="4" placeholder="CODE" aria-label="Room code" autocomplete="off" autocapitalize="characters"><button data-a="join">Join</button></div>
           <div class="sep">or</div>
           <button data-a="local">Local 2 players (one keyboard)</button>
-          <div class="msg"></div>`);
+          <div class="msg"></div>
+          <button data-a="check" style="font-size:13px;padding:8px">Test my connection</button>
+          <div class="small dbg"></div>`);
         c.querySelector('.msg').textContent = msg || '';
+        c.querySelector('.dbg').textContent = msg ? lastDebug : 'version ' + VERSION;
+        c.querySelector('[data-a=check]').onclick = () => net.selfTest();
         const inp = c.querySelector('input');
         c.querySelector('[data-a=host]').onclick = () => net.host();
         c.querySelector('[data-a=join]').onclick = () => net.join(inp.value);
@@ -466,7 +518,8 @@ Game.Net = (function () {
           <div class="small link"></div>
           <button data-a="copy">Copy link</button>
           <div class="msg ok">Waiting for your friend to join... Keep this screen open.</div>
-          <button data-a="back">Cancel</button>`);
+          <button data-a="back">Cancel</button><div class="small dbg"></div>`);
+        c.querySelector('.dbg').textContent = lastDebug;
         c.querySelector('.code').textContent = code;
         c.querySelector('.link').textContent = link;
         c.querySelector('[data-a=copy]').onclick = (e) => {
@@ -476,13 +529,14 @@ Game.Net = (function () {
         c.querySelector('[data-a=back]').onclick = () => { attempt++; endQuiet(); ui.show(''); };
       },
       connecting(text) {
-        const c = card(`<h1>Online</h1><div class="msg ok"></div><button data-a="back">Cancel</button>`);
+        const c = card(`<h1>Online</h1><div class="msg ok"></div><button data-a="back">Cancel</button><div class="small dbg"></div>`);
         c.querySelector('.msg').textContent = text;
         c.querySelector('[data-a=back]').onclick = () => { attempt++; endQuiet(); ui.show(''); };
       },
+      debugLine(text) { lastDebug = text; const d = menu.querySelector('.dbg'); if (d) d.textContent = text; },
       setMsg(text) { const m = menu.querySelector('.msg'); if (m && !menu.hidden) m.textContent = text; },
       joining(code) {
-        const c = card(`<h1>Joining ${code}...</h1><div class="msg ok">Connecting to the game server...</div><button data-a="back">Cancel</button>`);
+        const c = card(`<h1>Joining ${code}...</h1><div class="msg ok">Connecting to the game server...</div><button data-a="back">Cancel</button><div class="small dbg"></div>`);
         c.querySelector('[data-a=back]').onclick = () => { attempt++; endQuiet(); ui.show(''); };
       },
       error(msg) {
