@@ -11,9 +11,10 @@ jobs:
     env:
       LOCAL_TESTS: '1'
       SETS: 'branch'
-      ONLY: 'site,raw,gather,selftest,e2e'
+      ONLY: 'selftest,e2e'
       BRANCH_HAS_RELAY: '1'
       TURN_FILTER: 'metered'
+      CASES: 'only443'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

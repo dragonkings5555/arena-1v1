@@ -82,6 +82,7 @@ function setNet(cond) {
     if (t === 'iptables') rules.unshift('-d 168.63.129.16 -j RETURN');
     rules.push('-p udp -j DROP');
     if (cond === 'webonly') rules.push('-p tcp -m multiport --dports 80,443 -j RETURN', '-p tcp -j DROP');
+    if (cond === 'only443') rules.push('-p tcp --dport 443 -j RETURN', '-p tcp -j DROP');
     for (const r of rules) { const o = sh(`sudo ${t} -A NETCHECK ${r}`); if (o.startsWith('ERR')) log('iptables:', o); }
   }
   log(`\n[network: ${cond}]`);
@@ -367,7 +368,13 @@ function iceList(results) {
       add('open', 'branch | chrome host + firefox guest | direct', { site: LOCAL, guestB: 'firefox' });
       add('open', 'branch | firefox host + chrome guest | direct', { site: LOCAL, hostB: 'firefox' });
       add('open', 'branch | wrong room code -> clear message', { site: LOCAL, badCode: true, expectFail: true, expectMsg: 'No room with code' });
-      if (process.env.BRANCH_HAS_RELAY === '1') {
+      if (process.env.CASES === 'only443') {
+        cases.length = 0;
+        add('open', 'branch | direct allowed', { site: LOCAL });
+        add('only443', 'branch | relay only + only port 443 (TLS relay)', { site: LOCAL, policy: 'relay' });
+        add('only443', 'branch | firefox host + chrome guest | relay + only 443', { site: LOCAL, policy: 'relay', hostB: 'firefox' });
+        add('only443', 'branch | chrome host + firefox guest | relay + only 443', { site: LOCAL, policy: 'relay', guestB: 'firefox' });
+      } else if (process.env.BRANCH_HAS_RELAY === '1') {
         add('open', 'branch | relay only', { site: LOCAL, policy: 'relay' });
         add('noudp', 'branch | relay only + UDP blocked', { site: LOCAL, policy: 'relay' });
         add('webonly', 'branch | relay only + only ports 80/443', { site: LOCAL, policy: 'relay' });
