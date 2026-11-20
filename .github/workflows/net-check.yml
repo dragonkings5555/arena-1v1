@@ -11,8 +11,9 @@ jobs:
     env:
       LOCAL_TESTS: '1'
       SETS: 'branch'
-      ONLY: 'site,selftest,e2e'
-      BRANCH_HAS_RELAY: '0'
+      ONLY: 'site,raw,gather,selftest,e2e'
+      BRANCH_HAS_RELAY: '1'
+      TURN_FILTER: 'metered'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

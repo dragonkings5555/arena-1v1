@@ -51,6 +51,21 @@ const TURN = [
   ['turn:freeturn.net:443?transport=tcp', F],
   ['turns:freeturn.tel:443?transport=tcp', F],
 ];
+// The relay account configured in the branch's net.js (if any): test every Metered host/port/transport with it.
+const MC = (() => {
+  try {
+    const src = fs.readFileSync(require('path').join(__dirname, '../../net.js'), 'utf8');
+    const block = src.slice(src.indexOf('const RELAY = {'), src.indexOf('const STUN_SERVERS'));
+    const u = /username: '([^']+)'/.exec(block), c = /credential: '([^']+)'/.exec(block);
+    return u && c ? [u[1], c[1]] : null;
+  } catch (e) { return null; }
+})();
+if (MC) for (const h of ['global.relay.metered.ca', 'a.relay.metered.ca']) {
+  for (const u of [`turn:${h}:80`, `turn:${h}:80?transport=tcp`, `turn:${h}:443`, `turn:${h}:443?transport=tcp`,
+    `turns:${h}:443?transport=tcp`, `turn:${h}:3478`, `turn:${h}:3478?transport=tcp`, `turns:${h}:5349?transport=tcp`]) TURN.push([u, MC, 'metered']);
+}
+const TURN_FILTER = process.env.TURN_FILTER ? new RegExp(process.env.TURN_FILTER) : null;
+const turnList = () => TURN.filter(([url, , tag]) => !TURN_FILTER || TURN_FILTER.test(url + ' ' + (tag || '')));
 const STUN = ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun.cloudflare.com:3478',
   'stun:openrelay.metered.ca:80', 'stun:stun.relay.metered.ca:80', 'stun:freeturn.net:3478', 'stun:freeturn.net:5349'];
 
@@ -84,7 +99,7 @@ async function gatherAll() {
   const page = await b.newPage();
   await page.goto('about:blank');
   const out = [];
-  for (const [url, [username, credential]] of TURN) {
+  for (const [url, [username, credential]] of turnList()) {
     const r = await page.evaluate(async ({ server, ms }) => {
       const pc = new RTCPeerConnection({ iceServers: [server], iceTransportPolicy: 'relay' });
       pc.createDataChannel('x');
@@ -227,6 +242,7 @@ async function e2e(c) {
       res.kbPerSec = Math.round((s1.bytes - s0.bytes) / 1024 / dt);
       res.snapBytes = await guest.evaluate(() => Game.Net.lastSnapBytes);
       res.pingMs = await host.evaluate(() => Game.Net.rtt);
+      res.statusLine = await guest.evaluate(() => document.getElementById('net-status').textContent);
     }
     res.logs = logs.filter((l) => !/favicon/.test(l)).slice(0, 12);
   } catch (e) { res.err = e.message.split('\n')[0]; }
@@ -277,17 +293,34 @@ function iceList(results) {
   }
 
   let raw = [];
+  // A relay provider's credentials URL (e.g. Metered): check every TURN URL it hands out with a real allocation.
+  if (process.env.RELAY_URL) {
+    log('\n== Relay provider credentials');
+    try {
+      const j = await (await fetch(process.env.RELAY_URL)).json();
+      const list = Array.isArray(j) ? j : [].concat(j.iceServers || []);
+      report.provider = [];
+      for (const srv of list) {
+        for (const url of [].concat(srv.urls || [])) {
+          if (!/^turns?:/.test(url)) continue;
+          const r = await testTurn(url, srv.username, srv.credential);
+          report.provider.push(r);
+          log(`${r.ok ? 'OK  ' : 'FAIL'} ${url.padEnd(56)} ${r.ok ? 'relay ' + r.relayed + (r.transport === 'tls' ? ' cert ' + (r.certOk ? 'valid' : 'INVALID') : '') : r.stage + ': ' + r.err} (${r.ms}ms)`);
+        }
+      }
+    } catch (e) { log('credentials URL failed: ' + e.message); }
+  }
   if (step('raw')) {
     log('\n== STUN binding');
     report.stun = [];
-    for (const u of STUN) { const r = await testStun(u); report.stun.push(r); log(`${r.ok ? 'OK  ' : 'FAIL'} ${u.padEnd(40)} ${r.ok ? 'public ' + r.mapped : r.err} (${r.ip})`); }
+    for (const u of TURN_FILTER ? ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478', 'stun:stun.relay.metered.ca:80'] : STUN) { const r = await testStun(u); report.stun.push(r); log(`${r.ok ? 'OK  ' : 'FAIL'} ${u.padEnd(40)} ${r.ok ? 'public ' + r.mapped : r.err} (${r.ip})`); }
     log('\n== TURN allocate (real credentials check)');
-    for (const [url, [u, p], tag] of TURN) {
+    for (const [url, [u, p], tag] of turnList()) {
       const r = await testTurn(url, u, p);
-      r.inLiveConfig = !!tag;
+      r.tag = tag || '';
       raw.push(r);
       const what = r.ok ? `relay ${r.relayed}` + (r.transport === 'tls' ? ` cert ${r.certOk ? 'valid' : 'INVALID ' + r.certErr}` : '') : `${r.stage}: ${r.err}`;
-      log(`${r.ok ? 'OK  ' : 'FAIL'} ${tag ? '[live] ' : '       '}${url.padEnd(56)} ${what} (${r.ip}${r.realm ? ', realm ' + r.realm : ''}, ${r.ms}ms)`);
+      log(`${r.ok ? 'OK  ' : 'FAIL'} ${(tag ? '[' + tag + ']' : '').padEnd(10)}${url.padEnd(56)} ${what} (${r.ip}${r.realm ? ', realm ' + r.realm : ''}, ${r.ms}ms)`);
     }
     report.turn = raw;
   }
