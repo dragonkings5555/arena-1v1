@@ -111,7 +111,9 @@
   }
 
   let last = performance.now();
-  function frame(now) {
+  // One game step. The rAF loop below calls it; net.js also calls it from a worker timer while an online
+  // host's tab is hidden (browsers pause rAF in background tabs, which would freeze the match for the guest).
+  function tick(now) {
     const dt = Math.min((now - last) / 1000, 1 / 20); // clamp so tab-switching doesn't teleport things
     last = now;
     const net = Game.Net;
@@ -127,9 +129,13 @@
       }
       if (net && net.mode === 'host') net.hostTick();
     }
-    draw();
+    if (!document.hidden) draw();
+  }
+  function frame(now) {
+    tick(now);
     requestAnimationFrame(frame);
   }
+  Game.tick = tick;
 
   // Exposed for debugging / tests.
   Game.state = state;

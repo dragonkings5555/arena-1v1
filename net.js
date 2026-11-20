@@ -8,7 +8,7 @@
 window.Game = window.Game || {};
 
 Game.Net = (function () {
-  const VERSION = 'v3';
+  const VERSION = 'v4';
   const PEER_PREFIX = 'arena1v1-room-';
   const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const params = new URLSearchParams(location.search);
@@ -181,6 +181,19 @@ Game.Net = (function () {
     });
   }
 
+  // ---------- keep the host running in a background tab ----------
+  // rAF stops in hidden tabs and plain timers get throttled to ~1/s, but worker timers keep ticking.
+  let bgWorker = null;
+  function bgLoop(on) {
+    if (on && !bgWorker) {
+      try {
+        const src = 'setInterval(() => postMessage(0), 1000 / 60);';
+        bgWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+        bgWorker.onmessage = () => { if (document.hidden && net.mode === 'host' && Game.tick) Game.tick(performance.now()); };
+      } catch (e) { bgWorker = null; }
+    } else if (!on && bgWorker) { bgWorker.terminate(); bgWorker = null; }
+  }
+
   // ---------- session setup ----------
   function onlineLabels(isGuest) {
     const players = Game.players;
@@ -214,6 +227,7 @@ Game.Net = (function () {
       Game.players.forEach((p) => { p.wins = 0; });
       Game.openSelect();
       clearInterval(pingTimer);
+      bgLoop(true);
       pingTimer = setInterval(() => { if (conn && conn.open) conn.send(JSON.stringify({ t: 'ping', ts: performance.now() })); }, 1000);
     }
     UI.hide();
@@ -222,6 +236,7 @@ Game.Net = (function () {
 
   function endSession(reason) {
     clearInterval(pingTimer);
+    bgLoop(false);
     const wasOnline = net.mode !== 'local';
     net.mode = 'local';
     latestSnap = null;
