@@ -279,28 +279,62 @@ Game.Net = (function () {
     return { c, ch };
   }
 
-  function peerOpts() { return { debug: 0 }; }
+  // STUN finds each device's public address; TURN relays traffic when the two networks block a direct link
+  // (common on phones on mobile data, school/work wifi). Several servers so one being down doesn't break joining.
+  const ICE_SERVERS = [
+    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' },
+    { urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443', 'turn:openrelay.metered.ca:443?transport=tcp'],
+      username: 'openrelayproject', credential: 'openrelayproject' },
+  ];
+  function peerOpts() { return { debug: 1, config: { iceServers: ICE_SERVERS } }; }
+
+  let attempt = 0; // bumps on every host/join so timers from an old attempt can't show errors over a new one
+
+  // Watch the WebRTC link of a connection that hasn't opened yet and say what is happening.
+  function watchIce(c, isCurrent, onFail) {
+    const pc = c.peerConnection;
+    if (!pc) return;
+    pc.addEventListener('iceconnectionstatechange', () => {
+      if (!isCurrent()) return;
+      const st = pc.iceConnectionState;
+      if (st === 'checking') UI.setMsg('Linking the two devices...');
+      if (st === 'failed') onFail();
+    });
+  }
 
   net.host = function () {
     endQuiet();
+    const my = ++attempt;
     const code = randomCode();
     net.code = code;
-    UI.waiting(code);
     if (useBC) {
+      UI.waiting(code);
       const { c } = bcConn(code, 'host');
       c.on('open', () => { wire(c, 'host'); startSession('host', c); });
       peer = { destroy() { c.close(); } };
       return;
     }
     if (!window.Peer) return UI.error('Online play could not load (PeerJS missing).');
-    peer = new Peer(PEER_PREFIX + code, peerOpts());
-    peer.on('error', (e) => {
+    UI.connecting('Creating room...');
+    const p = peer = new Peer(PEER_PREFIX + code, peerOpts());
+    const cur = () => my === attempt && net.mode === 'local';
+    const regTimeout = setTimeout(() => { if (cur() && !p.open) UI.error('Could not reach the game server to create a room. Check your internet and try again.'); }, 12000);
+    p.on('open', () => { clearTimeout(regTimeout); if (cur()) UI.waiting(code); });
+    // Phones drop the server connection when you switch apps (e.g. to send the code); reconnect so the room stays joinable.
+    p.on('disconnected', () => { if (my === attempt && !p.destroyed) setTimeout(() => { if (!p.destroyed) p.reconnect(); }, 500); });
+    p.on('error', (e) => {
+      if (!cur()) return;
       if (e.type === 'unavailable-id') return net.host(); // code taken, roll a new one
-      if (net.mode === 'local') UI.error('Could not create a room (' + (e.type || e.message) + '). Check your connection and try again.');
+      if (e.type === 'network' || e.type === 'server-error' || e.type === 'socket-error' || e.type === 'socket-closed') return; // handled by reconnect
+      UI.error('Room problem (' + (e.type || e.message) + '). Try creating the room again.');
     });
-    peer.on('connection', (c) => {
+    p.on('connection', (c) => {
       if (conn) { c.on('open', () => c.close()); return; } // room is full
-      c.on('open', () => { wire(c, 'host'); startSession('host', c); });
+      if (cur()) UI.setMsg('Your friend found the room. Linking the two devices...');
+      c.on('open', () => { if (my === attempt) { wire(c, 'host'); startSession('host', c); } });
+      setTimeout(() => watchIce(c, cur, () => UI.setMsg('Your friend found the room, but your networks blocked the link. Try a different wifi or mobile data.')), 0);
     });
   };
 
@@ -308,6 +342,7 @@ Game.Net = (function () {
     code = String(code || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
     if (code.length < 4) return UI.error('Enter the 4-letter room code.');
     endQuiet();
+    const my = ++attempt;
     net.code = code;
     UI.joining(code);
     if (useBC) {
@@ -318,16 +353,28 @@ Game.Net = (function () {
       return;
     }
     if (!window.Peer) return UI.error('Online play could not load (PeerJS missing).');
-    peer = new Peer(peerOpts());
-    const timeout = setTimeout(() => { if (net.mode === 'local') UI.error('Could not reach room ' + code + '. Check the code, and that the host is still waiting.'); }, 15000);
-    peer.on('open', () => {
-      const c = peer.connect(PEER_PREFIX + code, { reliable: true, serialization: 'raw' });
-      c.on('open', () => { clearTimeout(timeout); wire(c, 'guest'); startSession('guest', c); });
+    const p = peer = new Peer(peerOpts());
+    const cur = () => my === attempt && net.mode === 'local';
+    let stage = 'server';
+    const fail = (msg) => { if (cur()) { endQuiet(); UI.error(msg); } };
+    const timeout = setTimeout(() => {
+      if (stage === 'server') fail('Could not reach the game server. Check your internet and try again.');
+      else fail('Found room ' + code + ' but could not link to the host. Make sure the host is still on the room screen (on a phone, keep the game open), then try again. If it keeps failing, one of your networks is blocking it: try mobile data or a different wifi.');
+    }, 25000);
+    p.on('open', () => {
+      if (!cur()) return;
+      stage = 'room';
+      UI.setMsg('Looking for room ' + code + '...');
+      const c = p.connect(PEER_PREFIX + code, { reliable: true, serialization: 'raw' });
+      c.on('open', () => { clearTimeout(timeout); if (my === attempt) { wire(c, 'guest'); startSession('guest', c); } });
+      c.on('error', (e) => { if (cur()) UI.setMsg('Connection error: ' + (e.type || e.message)); });
+      setTimeout(() => watchIce(c, cur, () => { stage = 'ice'; }), 0);
     });
-    peer.on('error', (e) => {
+    p.on('error', (e) => {
+      if (!cur()) return;
       clearTimeout(timeout);
-      if (net.mode !== 'local') return;
-      UI.error(e.type === 'peer-unavailable' ? 'No room with code ' + code + '. Check the code with your friend.' : 'Could not connect (' + (e.type || e.message) + ').');
+      if (e.type === 'peer-unavailable') fail('No room with code ' + code + '. Check the code, and that the host is still on the room screen.');
+      else fail('Could not connect (' + (e.type || e.message) + '). Try again.');
     });
   };
 
@@ -418,7 +465,7 @@ Game.Net = (function () {
           <div class="small">or send them this link:</div>
           <div class="small link"></div>
           <button data-a="copy">Copy link</button>
-          <div class="msg ok">Waiting for your friend to join...</div>
+          <div class="msg ok">Waiting for your friend to join... Keep this screen open.</div>
           <button data-a="back">Cancel</button>`);
         c.querySelector('.code').textContent = code;
         c.querySelector('.link').textContent = link;
@@ -426,11 +473,17 @@ Game.Net = (function () {
           const b = e.target;
           (navigator.clipboard ? navigator.clipboard.writeText(link) : Promise.reject()).then(() => { b.textContent = 'Copied!'; }, () => { b.textContent = 'Copy failed, select the link above'; });
         };
-        c.querySelector('[data-a=back]').onclick = () => { endQuiet(); ui.show(''); };
+        c.querySelector('[data-a=back]').onclick = () => { attempt++; endQuiet(); ui.show(''); };
       },
+      connecting(text) {
+        const c = card(`<h1>Online</h1><div class="msg ok"></div><button data-a="back">Cancel</button>`);
+        c.querySelector('.msg').textContent = text;
+        c.querySelector('[data-a=back]').onclick = () => { attempt++; endQuiet(); ui.show(''); };
+      },
+      setMsg(text) { const m = menu.querySelector('.msg'); if (m && !menu.hidden) m.textContent = text; },
       joining(code) {
-        const c = card(`<h1>Joining ${code}...</h1><div class="msg ok">Connecting to the host</div><button data-a="back">Cancel</button>`);
-        c.querySelector('[data-a=back]').onclick = () => { endQuiet(); ui.show(''); };
+        const c = card(`<h1>Joining ${code}...</h1><div class="msg ok">Connecting to the game server...</div><button data-a="back">Cancel</button>`);
+        c.querySelector('[data-a=back]').onclick = () => { attempt++; endQuiet(); ui.show(''); };
       },
       error(msg) {
         ui.show(msg);
