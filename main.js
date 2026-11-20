@@ -3,8 +3,22 @@
   const C = Game.CONFIG;
   const canvas = document.getElementById('game');
   const ctx = canvas.getContext('2d');
-  canvas.width = C.WIDTH;
-  canvas.height = C.HEIGHT;
+  // Crisp rendering: size the canvas's backing store to its on-screen size x devicePixelRatio,
+  // and draw in game units (C.WIDTH x C.HEIGHT) through a scale transform.
+  let renderScale = 1;
+  function fitCanvas() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 3);
+    const availW = Math.max(200, window.innerWidth - 32);
+    const availH = Math.max(150, window.innerHeight - 60);
+    const fit = Math.min(availW / C.WIDTH, availH / C.HEIGHT);
+    canvas.style.width = Math.floor(C.WIDTH * fit) + 'px';
+    canvas.style.height = Math.floor(C.HEIGHT * fit) + 'px';
+    canvas.width = Math.round(C.WIDTH * fit * dpr);
+    canvas.height = Math.round(C.HEIGHT * fit * dpr);
+    renderScale = canvas.width / C.WIDTH;
+  }
+  fitCanvas();
+  window.addEventListener('resize', fitCanvas);
 
   const players = C.PLAYERS.map((def) => new Game.Player(def));
   // phase: 'select' | 'playing' | 'roundOver' | 'matchOver'
@@ -94,6 +108,9 @@
   }
 
   function draw() {
+    ctx.setTransform(renderScale, 0, 0, renderScale, 0, 0);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
     ctx.clearRect(0, 0, C.WIDTH, C.HEIGHT);
     Game.Arena.draw(ctx);
     if (state.phase === 'select') {

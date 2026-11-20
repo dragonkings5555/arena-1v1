@@ -7,7 +7,7 @@ Game.Abilities.VoidPhase = class VoidPhase {
     this.owner = owner;
     this.DURATION = 3.0;
     this.COOLDOWN = 7.0;
-    this.ALPHA = 0.12;
+    this.ALPHA = 0;      // fully invisible to the opponent
     this.SPEED_BOOST = 1.15;
     this.IMPLODE_TIME = 0.3;
     this.TEAR_TIME = 0.35;
@@ -147,28 +147,36 @@ Game.Abilities.VoidPhase = class VoidPhase {
     }
   }
 
+  // Online, the Voidwalker's own screen may show a faint marker; locally (shared screen) nothing gives them away.
+  _ownerSees() {
+    const net = Game.Net;
+    if (!net || net.mode === 'local' || !Game.players) return false;
+    return Game.players[net.mode === 'guest' ? 1 : 0] === this.owner;
+  }
+
   draw(ctx) {
     const o = this.owner;
+    const secret = this.inVoid && !this._ownerSees(); // hide in-void tells (smoke, ripples, motes, outline)
     ctx.save();
 
     const TAU = Math.PI * 2, now0 = performance.now() / 1000;
     // Wispy dark smoke.
     ctx.fillStyle = '#12061f';
-    for (const m of this.smoke) {
+    for (const m of (secret ? [] : this.smoke)) {
       const k = m.life / 1.2;
       ctx.globalAlpha = Math.min(0.4, k * 0.5);
       ctx.beginPath(); ctx.arc(m.x, m.y, m.r * (1.6 - Math.min(1, k)), 0, TAU); ctx.fill();
     }
     // Distortion ripples.
     ctx.strokeStyle = '#8a5cd0'; ctx.lineWidth = 1.5;
-    for (const r of this.ripples) {
+    for (const r of (secret ? [] : this.ripples)) {
       const k = r.t / 0.9;
       ctx.globalAlpha = (1 - k) * 0.3;
       ctx.beginPath(); ctx.arc(r.x, r.y, 10 + 45 * k, 0, TAU); ctx.stroke();
     }
 
     // Trail motes: tiny fading dark-violet specks.
-    for (const m of this.motes) {
+    for (const m of (secret ? [] : this.motes)) {
       ctx.globalAlpha = Math.min(1, m.life / this.MOTE_LIFE) * 0.55;
       ctx.fillStyle = '#5b2a9e';
       ctx.beginPath(); ctx.arc(m.x, m.y, m.r, 0, Math.PI * 2); ctx.fill();
@@ -206,7 +214,7 @@ Game.Abilities.VoidPhase = class VoidPhase {
     }
 
     // Dark shimmer outline around the hidden owner.
-    if (this.inVoid && o.alive) {
+    if (this.inVoid && o.alive && !secret) {
       const now = performance.now() / 1000;
       const lowTime = this.timeLeft < 0.6 ? 0.5 + 0.5 * Math.sin(now * 30) : 1; // flicker before ending
       ctx.globalAlpha = (0.22 + 0.1 * Math.sin(now * 7)) * lowTime;

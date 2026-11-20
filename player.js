@@ -142,6 +142,7 @@ Game.Player = class {
   }
 
   draw(ctx) {
+    if (this.alive && this.drawAlpha <= 0) return; // fully invisible (e.g. Void): draw nothing at all
     ctx.save();
     ctx.globalAlpha = this.alive ? this.drawAlpha : 0.3; // faded corpse / ability fade
 

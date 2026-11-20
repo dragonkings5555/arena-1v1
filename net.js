@@ -8,7 +8,7 @@
 window.Game = window.Game || {};
 
 Game.Net = (function () {
-  const VERSION = 'v4';
+  const VERSION = 'v5';
   const PEER_PREFIX = 'arena1v1-room-';
   const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const params = new URLSearchParams(location.search);
