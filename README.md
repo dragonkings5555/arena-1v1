@@ -4,6 +4,8 @@
 
 **Online:** one player clicks "Play online: create room" and shares the 4-letter code (or link); the other types the code and clicks Join. Both use WASD + Space/E/C/Q/F on their own device; phones get an on-screen stick and buttons. The host's browser runs the match and streams snapshots; the guest sends keys (`net.js`, PeerJS WebRTC, vendored in `vendor/`). Online needs a real website (e.g. GitHub Pages); the Artifact viewer blocks WebRTC. Test two tabs without internet with `index.html?net=bc`.
 
+**Relay (TURN):** when the two devices can't reach each other directly (school or work wifi often keeps devices apart, some phones on mobile data), WebRTC needs a relay server. The old free public relays are gone (checked 2026-11-20), so the game is STUN-only until you add one from a free account in `RELAY` in `net.js` (a credentials URL such as Metered's, or fixed TURN entries). "Test my connection" says whether a relay is set up and reachable; during a match the status line shows `direct` or `relay`.
+
 **Character select:** P1 picks with A/D and locks in with Space. P2 picks with J/L and locks in with H.
 
 **In game:**

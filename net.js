@@ -8,7 +8,7 @@
 window.Game = window.Game || {};
 
 Game.Net = (function () {
-  const VERSION = 'v5';
+  const VERSION = 'v6';
   const PEER_PREFIX = 'arena1v1-room-';
   const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const params = new URLSearchParams(location.search);
@@ -18,6 +18,7 @@ Game.Net = (function () {
     mode: 'local', // 'local' | 'host' | 'guest'
     code: null,
     rtt: null,
+    route: null, // 'direct' or 'relay udp/tcp/tls' once linked
     lastSnapBytes: 0,
   };
 
@@ -230,6 +231,8 @@ Game.Net = (function () {
       bgLoop(true);
       pingTimer = setInterval(() => { if (conn && conn.open) conn.send(JSON.stringify({ t: 'ping', ts: performance.now() })); }, 1000);
     }
+    net.route = null;
+    setTimeout(() => detectRoute(c), 1500);
     UI.hide();
     UI.status();
   }
@@ -241,6 +244,7 @@ Game.Net = (function () {
     net.mode = 'local';
     latestSnap = null;
     net.rtt = null;
+    net.route = null;
     if (conn) { try { conn.close(); } catch (e) {} }
     conn = null;
     if (peer) { try { peer.destroy(); } catch (e) {} }
@@ -295,16 +299,41 @@ Game.Net = (function () {
     return { c, ch };
   }
 
-  // STUN finds each device's public address; TURN relays traffic when the two networks block a direct link
-  // (common on phones on mobile data, school/work wifi). Several servers so one being down doesn't break joining.
-  const ICE_SERVERS = [
-    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
-    { urls: 'stun:stun.cloudflare.com:3478' },
-    { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' },
-    { urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443', 'turn:openrelay.metered.ca:443?transport=tcp'],
-      username: 'openrelayproject', credential: 'openrelayproject' },
-  ];
-  function peerOpts() { return { debug: 1, config: { iceServers: ICE_SERVERS } }; }
+  // ---------- ICE servers (how the two devices find a route to each other) ----------
+  // STUN finds each device's public address. That is enough when the devices can reach each other directly
+  // (most home wifi, phone hotspots). TURN relays the game when they can't: school/work wifi that keeps devices
+  // apart, some phones on mobile data. The old free relays (eu-0/us-0.turn.peerjs.com, openrelay.metered.ca) are
+  // gone (checked 2026-11-20: two no longer exist, one points at a dummy address), so a relay needs a free account.
+  // Fill in ONE of these to switch the relay on:
+  const RELAY = {
+    // A URL that returns TURN credentials as JSON (an iceServers array, or { iceServers: [...] }), e.g. Metered:
+    // 'https://<your-app>.metered.live/api/v1/turn/credentials?apiKey=<your-api-key>'
+    credentialsUrl: '',
+    // Or fixed TURN entries from a provider's dashboard: { urls: ['turn:...:3478', 'turns:...:443?transport=tcp'], username, credential }
+    servers: [],
+  };
+  const STUN_SERVERS = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }];
+  let relayCache = null, relayCacheAt = 0;
+  function getIceServers() {
+    if (RELAY.servers.length) return Promise.resolve(STUN_SERVERS.concat(RELAY.servers));
+    if (!RELAY.credentialsUrl) return Promise.resolve(STUN_SERVERS);
+    if (relayCache && performance.now() - relayCacheAt < 10 * 60 * 1000) return Promise.resolve(relayCache);
+    const ctl = window.AbortController ? new AbortController() : null;
+    const t = setTimeout(() => { if (ctl) ctl.abort(); }, 6000);
+    return fetch(RELAY.credentialsUrl, ctl ? { signal: ctl.signal } : {})
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
+      .then((j) => {
+        const list = Array.isArray(j) ? j : j && j.iceServers ? [].concat(j.iceServers) : [];
+        if (!list.length) throw new Error('no servers');
+        relayCache = STUN_SERVERS.concat(list);
+        relayCacheAt = performance.now();
+        return relayCache;
+      })
+      .catch((e) => { debug('last', 'relay setup failed (' + (e.message || e) + ')'); return STUN_SERVERS; })
+      .then((list) => { clearTimeout(t); return list; });
+  }
+  const hasRelay = (servers) => servers.some((s) => [].concat(s.urls || []).some((u) => /^turns?:/.test(u)));
+  function peerOpts(servers) { return { debug: 1, config: { iceServers: servers } }; }
 
   // Visible debug line on the room/join screens, so a failed connect can be reported exactly.
   const dbg = { server: '-', link: '-', last: '' };
@@ -313,6 +342,7 @@ Game.Net = (function () {
   let attempt = 0; // bumps on every host/join so timers from an old attempt can't show errors over a new one
 
   // Watch the WebRTC link of a connection that hasn't opened yet and say what is happening.
+  // PeerJS creates the RTCPeerConnection synchronously in connect() / before 'connection' fires.
   function watchIce(c, isCurrent, onFail) {
     const pc = c.peerConnection;
     if (!pc) return;
@@ -320,9 +350,24 @@ Game.Net = (function () {
       if (!isCurrent()) return;
       const st = pc.iceConnectionState;
       debug('link', st);
-      if (st === 'checking') UI.setMsg('Linking the two devices...');
       if (st === 'failed') onFail();
     });
+  }
+
+  // Once linked, find out whether the devices talk directly or through a relay server (shown in the status line).
+  function detectRoute(c) {
+    const pc = c && c.peerConnection;
+    if (!pc || !pc.getStats) return;
+    pc.getStats().then((st) => {
+      let pair = null;
+      st.forEach((s) => { if (s.type === 'transport' && s.selectedCandidatePairId) pair = st.get(s.selectedCandidatePairId); });
+      if (!pair) st.forEach((s) => { if (!pair && s.type === 'candidate-pair' && s.state === 'succeeded' && (s.selected || s.nominated)) pair = s; });
+      const l = pair && st.get(pair.localCandidateId), r = pair && st.get(pair.remoteCandidateId);
+      if (!l || !r || conn !== c) return;
+      net.route = (l.candidateType === 'relay' || r.candidateType === 'relay') ? 'relay' + (l.relayProtocol ? ' ' + l.relayProtocol : '') : 'direct';
+      debug('link', 'connected (' + net.route + ')');
+      UI.status();
+    }).catch(() => {});
   }
 
   net.host = function () {
@@ -339,14 +384,22 @@ Game.Net = (function () {
     }
     if (!window.Peer) return UI.error('Online play could not load (PeerJS missing).');
     UI.connecting('Creating room...');
-    const p = peer = new Peer(PEER_PREFIX + code, peerOpts());
+    debug('server', 'connecting'); debug('link', '-'); debug('last', '');
+    getIceServers().then((servers) => { if (my === attempt && net.mode === 'local') openRoom(my, code, servers); });
+  };
+
+  function openRoom(my, code, servers) {
+    const relay = hasRelay(servers);
+    const p = peer = new Peer(PEER_PREFIX + code, peerOpts(servers));
     const cur = () => my === attempt && net.mode === 'local';
     const regTimeout = setTimeout(() => { if (cur() && !p.open) UI.error('Could not reach the game server to create a room. Check your internet and try again.'); }, 12000);
-    debug('server', 'connecting'); debug('link', '-');
     p.on('open', () => { clearTimeout(regTimeout); if (cur()) { UI.waiting(code); debug('server', 'registered ' + code); } });
     // Phones drop the server connection when you switch apps (e.g. to send the code); reconnect so the room stays joinable.
-    p.on('disconnected', () => { debug('server', 'lost, reconnecting'); });
-    p.on('disconnected', () => { if (my === attempt && !p.destroyed) setTimeout(() => { if (!p.destroyed) p.reconnect(); }, 500); });
+    p.on('disconnected', () => {
+      if (my !== attempt || p.destroyed) return;
+      debug('server', 'lost, reconnecting');
+      setTimeout(() => { if (!p.destroyed && p.disconnected) p.reconnect(); }, 500);
+    });
     p.on('error', (e) => {
       debug('last', 'error ' + e.type);
       if (!cur()) return;
@@ -358,10 +411,16 @@ Game.Net = (function () {
       if (conn) { c.on('open', () => c.close()); return; } // room is full
       if (cur()) UI.setMsg('Your friend found the room. Linking the two devices...');
       debug('last', 'friend knocked');
-      c.on('open', () => { if (my === attempt) { wire(c, 'host'); startSession('host', c); } });
-      setTimeout(() => watchIce(c, cur, () => UI.setMsg('Your friend found the room, but your networks blocked the link. Try a different wifi or mobile data.')), 0);
+      c.on('open', () => {
+        if (my !== attempt || conn) { c.close(); return; } // another guest linked first
+        wire(c, 'host');
+        startSession('host', c);
+      });
+      watchIce(c, cur, () => UI.setMsg(relay
+        ? 'Your friend found the room, but your networks would not let the devices connect, not even through the relay. Still waiting if they want to try again.'
+        : 'Your friend found the room, but your devices can\'t reach each other directly and the game has no relay server set up. Still waiting if they want to try again.'));
     });
-  };
+  }
 
   net.join = function (code) {
     code = String(code || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -378,33 +437,52 @@ Game.Net = (function () {
       return;
     }
     if (!window.Peer) return UI.error('Online play could not load (PeerJS missing).');
-    const p = peer = new Peer(peerOpts());
-    const cur = () => my === attempt && net.mode === 'local';
-    let stage = 'server';
     debug('server', 'connecting'); debug('link', '-'); debug('last', '');
-    const fail = (msg) => { if (cur()) { endQuiet(); UI.error(msg); } };
-    const timeout = setTimeout(() => {
-      if (stage === 'server') fail('Could not reach the game server. Check your internet and try again.');
-      else fail('Found room ' + code + ' but could not link to the host. Make sure the host is still on the room screen (on a phone, keep the game open), then try again. If it keeps failing, one of your networks is blocking it: try mobile data or a different wifi.');
-    }, 25000);
+    getIceServers().then((servers) => { if (my === attempt && net.mode === 'local') joinRoom(my, code, servers); });
+  };
+
+  function joinRoom(my, code, servers) {
+    const p = peer = new Peer(peerOpts(servers));
+    const cur = () => my === attempt && net.mode === 'local';
+    // Stages: reach the game server -> the host's game answers -> the two devices link (directly or via a relay).
+    const STAGE_MSG = {
+      server: 'Could not reach the game server. Check your internet and try again.',
+      room: 'Room ' + code + ' is there, but the host\'s game is not answering. The host should keep the game open on screen (on a phone, don\'t switch apps), then try again.',
+      link: hasRelay(servers)
+        ? 'Found the host, but your two networks would not let the devices connect, not even through the relay. Some school or work wifi blocks this on purpose. Try mobile data or a different wifi.'
+        : 'Found the host, but your two devices can\'t reach each other directly, and the game has no relay server set up yet. School or work wifi often keeps devices apart. Try both on the same home wifi or a phone hotspot.',
+    };
+    let stage = 'server', timer = 0;
+    const fail = (msg) => { if (cur()) { clearTimeout(timer); endQuiet(); UI.error(msg); } };
+    const arm = (s, ms) => { stage = s; clearTimeout(timer); timer = setTimeout(() => fail(STAGE_MSG[stage]), ms); };
+    arm('server', 15000);
     p.on('open', () => {
       if (!cur()) return;
-      stage = 'room';
+      arm('room', 15000);
       debug('server', 'ok');
       UI.setMsg('Looking for room ' + code + '...');
       const c = p.connect(PEER_PREFIX + code, { reliable: true, serialization: 'raw' });
-      c.on('open', () => { clearTimeout(timeout); if (my === attempt) { wire(c, 'guest'); startSession('guest', c); } });
-      c.on('error', (e) => { debug('last', 'conn error ' + (e.type || e.message)); if (cur()) UI.setMsg('Connection error: ' + (e.type || e.message)); });
-      setTimeout(() => watchIce(c, cur, () => { stage = 'ice'; }), 0);
+      c.on('open', () => { clearTimeout(timer); if (my === attempt) { wire(c, 'guest'); startSession('guest', c); } });
+      c.on('error', (e) => { debug('last', 'conn error ' + (e.type || e.message)); if (e.type === 'negotiation-failed') fail(STAGE_MSG.link); });
+      const pc = c.peerConnection;
+      if (pc) pc.addEventListener('signalingstatechange', () => {
+        // The host's answer arrived: its game is alive, now the devices try every route (direct, then relay).
+        if (cur() && stage === 'room' && pc.signalingState === 'stable') {
+          arm('link', 30000);
+          debug('last', 'host answered');
+          UI.setMsg('Found the host. Linking the two devices...');
+        }
+      });
+      watchIce(c, cur, () => fail(STAGE_MSG.link));
     });
     p.on('error', (e) => {
       debug('last', 'error ' + e.type);
       if (!cur()) return;
-      clearTimeout(timeout);
       if (e.type === 'peer-unavailable') fail('No room with code ' + code + '. Check the code, and that the host is still on the room screen.');
+      else if (e.type === 'network' || e.type === 'server-error' || e.type === 'socket-error' || e.type === 'socket-closed') fail(stage === 'server' ? STAGE_MSG.server : 'Lost the game server while joining (' + e.type + '). Try again.');
       else fail('Could not connect (' + (e.type || e.message) + '). Try again.');
     });
-  };
+  }
 
   // Tear down any half-open attempt without showing a message.
   function endQuiet() {
@@ -414,37 +492,55 @@ Game.Net = (function () {
 
   // "Test my connection": can we reach the game server, and which kinds of network routes does this device get?
   // host = same-network route, srflx = internet route (STUN), relay = relay server (TURN, works on strict networks).
+  // relay over udp = fastest; tcp/tls = the relay still works on networks that only allow web traffic.
   net.selfTest = function () {
-    UI.connecting('Testing your connection (about 8 seconds)...');
-    const out = [];
-    let server = 'no reply';
+    const my = ++attempt;
+    endQuiet();
+    UI.connecting('Testing your connection (about 10 seconds)...');
+    getIceServers().then((servers) => { if (my === attempt) runSelfTest(my, servers); });
+  };
+
+  function runSelfTest(my, servers) {
+    let server = 'no reply', tp = null, pc = null, rtcErr = '';
     try {
-      const tp = new Peer(peerOpts());
+      tp = new Peer(peerOpts(servers));
       tp.on('open', () => { server = 'ok'; tp.destroy(); });
-      tp.on('error', (e) => { server = 'error ' + e.type; });
+      tp.on('error', (e) => { if (server !== 'ok') server = 'error ' + e.type; });
     } catch (e) { server = 'PeerJS failed: ' + e.message; }
     const kinds = { host: 0, srflx: 0, relay: 0 };
-    const relays = new Set();
-    let pc;
+    const via = { udp: 0, tcp: 0, tls: 0 };
+    const errs = new Set();
     try {
-      pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      pc = new RTCPeerConnection({ iceServers: servers });
       pc.createDataChannel('t');
       pc.onicecandidate = (e) => {
-        if (!e.candidate) return;
-        const m = / typ (\w+)/.exec(e.candidate.candidate);
-        if (m && m[1] in kinds) kinds[m[1]]++;
-        if (m && m[1] === 'relay' && e.candidate.url) relays.add(e.candidate.url.split(':')[1]);
+        const c = e.candidate;
+        if (!c || !c.candidate) return;
+        const m = / typ (\w+)/.exec(c.candidate);
+        const typ = c.type || (m && m[1]);
+        if (typ in kinds) kinds[typ]++;
+        // relayProtocol is missing in some browsers; libwebrtc encodes it in the priority (2 udp, 1 tcp, 0 tls).
+        const proto = c.relayProtocol || ['tls', 'tcp', 'udp'][(c.priority >>> 24)] || '';
+        if (typ === 'relay' && proto in via) via[proto]++;
       };
-      pc.createOffer().then((o) => pc.setLocalDescription(o));
-    } catch (e) { out.push('WebRTC unavailable: ' + e.message); }
+      pc.onicecandidateerror = (e) => { if (e.errorCode && /^turns?:/.test(e.url || 'turn:')) errs.add(e.errorCode); };
+      pc.createOffer().then((o) => pc.setLocalDescription(o)).catch((e) => { rtcErr = e.message; });
+    } catch (e) { rtcErr = e.message; }
     setTimeout(() => {
-      if (pc) pc.close();
-      out.unshift('Game server: ' + server);
-      out.push('Routes: same-network ' + kinds.host + ', internet ' + kinds.srflx + ', relay ' + kinds.relay + (relays.size ? ' (' + [...relays].join(', ') + ')' : ''));
-      const ok = server === 'ok' && (kinds.srflx || kinds.relay);
-      UI.show((ok ? 'Looks OK. ' : 'Problem found. ') + out.join(' | ') + ' | ' + VERSION);
-    }, 8000);
-  };
+      try { if (pc) pc.close(); if (tp && !tp.destroyed) tp.destroy(); } catch (e) {}
+      if (my !== attempt) return; // cancelled
+      const relayTxt = 'relay ' + kinds.relay + (kinds.relay ? ' (udp ' + via.udp + ', tcp ' + via.tcp + ', tls ' + via.tls + ')' : '');
+      const parts = ['Game server: ' + server, 'Routes: same-network ' + kinds.host + ', internet ' + kinds.srflx + ', ' + relayTxt];
+      if (errs.size) parts.push('relay errors ' + [...errs].join(','));
+      if (rtcErr) parts.push('WebRTC error: ' + rtcErr);
+      let verdict;
+      if (server !== 'ok') verdict = 'Problem: this network does not reach the game server, so online play cannot start here.';
+      else if (!hasRelay(servers)) verdict = 'No relay server is set up yet, so online play only works when the two devices can reach each other directly (same home wifi or a phone hotspot usually works, school wifi usually doesn\'t).';
+      else if (!kinds.relay) verdict = 'Problem: the relay server did not answer on this network' + (errs.has(401) ? ' (it rejected the login)' : '') + ', so online play only works when the two devices can reach each other directly.';
+      else verdict = 'Looks OK. Even if the two devices can\'t reach each other directly, the relay should connect them.';
+      UI.show(verdict + ' | ' + parts.join(' | ') + ' | ' + VERSION);
+    }, 10000);
+  }
 
   net.leave = function () { endSession(''); };
   net.local = function () { endQuiet(); UI.hide(); UI.status(); };
@@ -568,7 +664,7 @@ Game.Net = (function () {
           status.appendChild(b);
         } else {
           const me = net.mode === 'host' ? 'Player 1 (blue)' : 'Player 2 (orange)';
-          span.textContent = 'Online · room ' + net.code + ' · you are ' + me + (net.rtt != null ? ' · ping ' + net.rtt + ' ms' : '');
+          span.textContent = 'Online · room ' + net.code + ' · you are ' + me + (net.rtt != null ? ' · ping ' + net.rtt + ' ms' : '') + (net.route ? ' · ' + net.route : '');
           status.appendChild(span);
           const b = document.createElement('button'); b.textContent = 'Leave'; b.onclick = () => net.leave();
           status.appendChild(b);
