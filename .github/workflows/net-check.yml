@@ -9,7 +9,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      LOCAL_TESTS: '0'
+      LOCAL_TESTS: '1'
+      SETS: 'branch'
+      ONLY: 'site,selftest,e2e'
+      BRANCH_HAS_RELAY: '0'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

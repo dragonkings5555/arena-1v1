@@ -185,8 +185,19 @@ async function e2e(c) {
     await host.click('#net-menu [data-a=host]', { timeout: 15000 });
     const code = (await (await host.waitForSelector('#net-menu .code', { timeout: 25000 })).textContent()).trim();
     const t0 = Date.now();
-    await guest.goto(c.site + (c.site.includes('?') ? '&' : '?') + 'room=' + code, { waitUntil: 'load', timeout: 30000 });
+    await guest.goto(c.site + (c.site.includes('?') ? '&' : '?') + 'room=' + (c.badCode ? 'ZZZZ' : code), { waitUntil: 'load', timeout: 30000 });
     const wait = (p, fn) => p.waitForFunction(fn, null, { timeout: c.timeout || 50000, polling: 200 }).then(() => true, () => false);
+    if (c.expectFail) {
+      // Expect the guest to give up with a message (and see how long that takes).
+      const shown = await wait(guest, () => { const m = document.getElementById('net-menu'); return Game.Net.mode === 'guest' || (!m.hidden && m.querySelector('h1').textContent === 'Arena 1v1' && m.querySelector('.msg').textContent.length > 0); });
+      res.secs = +((Date.now() - t0) / 1000).toFixed(1);
+      res.guestUi = await guest.evaluate(uiInfo);
+      res.hostUi = await host.evaluate(uiInfo);
+      res.ok = shown && res.guestUi.mode === 'local' && (!c.expectMsg || new RegExp(c.expectMsg).test(res.guestUi.menu));
+      log(`${res.ok ? 'PASS' : 'FAIL'}  ${c.label}  (gave up after ${res.secs}s)`);
+      log('      ' + JSON.stringify(Object.assign({}, res, { label: undefined })));
+      return res;
+    }
     const [h, g] = await Promise.all([
       wait(host, () => Game.Net.mode === 'host' && Game.Net.rtt != null),
       wait(guest, () => Game.Net.mode === 'guest' && Game.Net.lastSnapBytes > 0),
@@ -250,6 +261,19 @@ function iceList(results) {
       report.liveVersion = (/VERSION = '([^']+)'/.exec(t) || [])[1];
     } catch (e) { report.liveVersion = 'ERR ' + e.message; }
     log('broker:', report.broker, '| live net.js version:', report.liveVersion);
+    // Double-check the relay hostnames against public DNS (not just this runner's resolver).
+    report.doh = {};
+    for (const h of ['eu-0.turn.peerjs.com', 'us-0.turn.peerjs.com', 'openrelay.metered.ca', 'staticauth.openrelay.metered.ca', 'freeturn.net', '0.peerjs.com']) {
+      const row = [];
+      for (const [name, url] of [['google', 'https://dns.google/resolve?type=A&name='], ['cloudflare', 'https://cloudflare-dns.com/dns-query?type=A&name=']]) {
+        try {
+          const j = await (await fetch(url + h, { headers: { accept: 'application/dns-json' } })).json();
+          row.push(name + ': ' + (j.Status === 3 ? 'NXDOMAIN' : (j.Answer || []).filter((a) => a.type === 1).map((a) => a.data).join(',') || 'no A record (status ' + j.Status + ')'));
+        } catch (e) { row.push(name + ': ERR ' + e.message); }
+      }
+      report.doh[h] = row.join(' | ');
+      log('DNS', h.padEnd(34), report.doh[h]);
+    }
   }
 
   let raw = [];
@@ -273,6 +297,18 @@ function iceList(results) {
     report.gather = await gatherAll();
   }
 
+  if (step('selftest') && (LOCAL || process.env.SELFTEST_SITE)) {
+    log('\n== "Test my connection" button');
+    const b = await launch('chrome');
+    const page = await b.newPage();
+    await page.goto(process.env.SELFTEST_SITE || LOCAL, { waitUntil: 'load' });
+    await page.click('#net-menu [data-a=check]');
+    await page.waitForFunction(() => /Routes:/.test(document.querySelector('#net-menu .msg').textContent), null, { timeout: 25000 }).catch(() => {});
+    report.selftest = await page.evaluate(() => document.querySelector('#net-menu .msg').textContent);
+    log(report.selftest);
+    await b.close();
+  }
+
   if (step('e2e')) {
     const working = raw.length ? iceList(raw) : null;
     report.workingIce = working;
@@ -280,23 +316,33 @@ function iceList(results) {
     log('working set: ' + JSON.stringify(working));
     const cases = [];
     const add = (net, label, extra) => cases.push(Object.assign({ net, label }, extra));
+    const SETS = (process.env.SETS || 'live,working,branch').split(',');
+    if (SETS.includes('live')) {
     add('open', 'live v5 | direct allowed', { site: LIVE });
     add('open', 'live v5 | relay only (devices isolated)', { site: LIVE, policy: 'relay' });
     add('noudp', 'live v5 | relay only + UDP blocked', { site: LIVE, policy: 'relay' });
     add('webonly', 'live v5 | relay only + only ports 80/443', { site: LIVE, policy: 'relay' });
     add('open', 'live v5 | chrome host + firefox guest | relay only', { site: LIVE, policy: 'relay', guestB: 'firefox' });
-    if (working && working.length > 1) {
+    }
+    if (SETS.includes('working') && working && working.length > 1) {
       add('open', 'working set | relay only', { site: LIVE, policy: 'relay', servers: working });
       add('noudp', 'working set | relay only + UDP blocked', { site: LIVE, policy: 'relay', servers: working });
       add('webonly', 'working set | relay only + only ports 80/443', { site: LIVE, policy: 'relay', servers: working });
     }
-    if (LOCAL) {
+    if (LOCAL && SETS.includes('branch')) {
       add('open', 'branch | direct allowed', { site: LOCAL });
-      add('open', 'branch | relay only', { site: LOCAL, policy: 'relay' });
-      add('noudp', 'branch | relay only + UDP blocked', { site: LOCAL, policy: 'relay' });
-      add('webonly', 'branch | relay only + only ports 80/443', { site: LOCAL, policy: 'relay' });
-      add('open', 'branch | chrome host + firefox guest | relay only', { site: LOCAL, policy: 'relay', guestB: 'firefox' });
-      add('webonly', 'branch | firefox host + chrome guest | relay + 80/443', { site: LOCAL, policy: 'relay', hostB: 'firefox' });
+      add('open', 'branch | chrome host + firefox guest | direct', { site: LOCAL, guestB: 'firefox' });
+      add('open', 'branch | firefox host + chrome guest | direct', { site: LOCAL, hostB: 'firefox' });
+      add('open', 'branch | wrong room code -> clear message', { site: LOCAL, badCode: true, expectFail: true, expectMsg: 'No room with code' });
+      if (process.env.BRANCH_HAS_RELAY === '1') {
+        add('open', 'branch | relay only', { site: LOCAL, policy: 'relay' });
+        add('noudp', 'branch | relay only + UDP blocked', { site: LOCAL, policy: 'relay' });
+        add('webonly', 'branch | relay only + only ports 80/443', { site: LOCAL, policy: 'relay' });
+        add('open', 'branch | chrome host + firefox guest | relay only', { site: LOCAL, policy: 'relay', guestB: 'firefox' });
+        add('webonly', 'branch | firefox host + chrome guest | relay + 80/443', { site: LOCAL, policy: 'relay', hostB: 'firefox' });
+      } else {
+        add('open', 'branch | relay only, no relay set up -> honest message', { site: LOCAL, policy: 'relay', expectFail: true, expectMsg: 'no relay server set up' });
+      }
     }
     report.e2e = [];
     let cur = null;
@@ -306,7 +352,10 @@ function iceList(results) {
     }
     setNet('open');
     log('\n== Summary');
-    for (const r of report.e2e) log(`${r.ok ? 'PASS' : 'FAIL'}  ${r.label}${r.ok ? `  ${r.secs}s, ${(r.guestLink.find((x) => x.local) || {}).local || ''}, ${r.snapsPerSec || '?'} snaps/s, ${r.kbPerSec || '?'} KB/s, ping ${r.pingMs}ms` : '  ' + ((r.guestUi && r.guestUi.dbg) || r.err || '')}`);
+    for (const r of report.e2e) {
+      if (!r.guestLink) { log(`${r.ok ? 'PASS' : 'FAIL'}  ${r.label}  ${r.secs}s: ${(r.guestUi && r.guestUi.menu) || r.err || ''}`); continue; }
+      log(`${r.ok ? 'PASS' : 'FAIL'}  ${r.label}${r.ok ? `  ${r.secs}s, ${(r.guestLink.find((x) => x.local) || {}).local || ''}, ${r.snapsPerSec || '?'} snaps/s, ${r.kbPerSec || '?'} KB/s, ping ${r.pingMs}ms` : '  ' + ((r.guestUi && r.guestUi.dbg) || r.err || '')}`);
+    }
   }
   fs.writeFileSync('netcheck-report.json', JSON.stringify(report, null, 2));
 })().catch((e) => { console.error(e); setNet('open'); process.exit(1); });
