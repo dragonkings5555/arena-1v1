@@ -524,8 +524,8 @@ Game.Net = (function () {
         const m = / typ (\w+)/.exec(c.candidate);
         const typ = c.type || (m && m[1]);
         if (typ in kinds) kinds[typ]++;
-        // relayProtocol is missing in some browsers; libwebrtc encodes it in the priority (2 udp, 1 tcp, 0 tls).
-        const proto = c.relayProtocol || ['tls', 'tcp', 'udp'][(c.priority >>> 24)] || '';
+        // relayProtocol says how this device reaches the relay; Chrome leaves it empty for UDP.
+        const proto = c.relayProtocol || 'udp';
         if (typ === 'relay' && proto in via) via[proto]++;
       };
       pc.onicecandidateerror = (e) => { if (e.errorCode && /^turns?:/.test(e.url || 'turn:')) errs.add(e.errorCode); };
