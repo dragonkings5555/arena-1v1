@@ -310,7 +310,12 @@ Game.Net = (function () {
     // 'https://<your-app>.metered.live/api/v1/turn/credentials?apiKey=<your-api-key>'
     credentialsUrl: '',
     // Or fixed TURN entries from a provider's dashboard: { urls: ['turn:...:3478', 'turns:...:443?transport=tcp'], username, credential }
-    servers: [],
+    // Metered (free account): UDP and TCP on 80/443, plus TLS on 443 for networks that only allow web traffic.
+    servers: [
+      { urls: ['turn:global.relay.metered.ca:80', 'turn:global.relay.metered.ca:80?transport=tcp',
+        'turn:global.relay.metered.ca:443', 'turns:global.relay.metered.ca:443?transport=tcp'],
+        username: '8e3dabb5063a3a313fed1acb', credential: '9T77iz9wnWyEcig9' },
+    ],
   };
   const STUN_SERVERS = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }];
   let relayCache = null, relayCacheAt = 0;
@@ -519,8 +524,8 @@ Game.Net = (function () {
         const m = / typ (\w+)/.exec(c.candidate);
         const typ = c.type || (m && m[1]);
         if (typ in kinds) kinds[typ]++;
-        // relayProtocol is missing in some browsers; libwebrtc encodes it in the priority (2 udp, 1 tcp, 0 tls).
-        const proto = c.relayProtocol || ['tls', 'tcp', 'udp'][(c.priority >>> 24)] || '';
+        // relayProtocol says how this device reaches the relay; Chrome leaves it empty for UDP.
+        const proto = c.relayProtocol || 'udp';
         if (typ === 'relay' && proto in via) via[proto]++;
       };
       pc.onicecandidateerror = (e) => { if (e.errorCode && /^turns?:/.test(e.url || 'turn:')) errs.add(e.errorCode); };
